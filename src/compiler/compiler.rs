@@ -1,4 +1,5 @@
 // Copyright 2016 Mozilla Foundation
+// SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,6 +14,7 @@
 // limitations under the License.
 
 use crate::cache::{Cache, CacheWrite, DecompressionFailure, FileObjectSource, Storage};
+use crate::compiler::args::*;
 use crate::compiler::c::{CCompiler, CCompilerKind};
 use crate::compiler::clang::Clang;
 use crate::compiler::diab::Diab;
@@ -22,13 +24,13 @@ use crate::compiler::msvc::Msvc;
 use crate::compiler::nvcc::Nvcc;
 use crate::compiler::rust::{Rust, RustupProxy};
 use crate::compiler::tasking_vx::TaskingVX;
-use crate::dist;
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
 #[cfg(feature = "dist-client")]
 use crate::lru_disk_cache;
 use crate::mock_command::{exit_status, CommandChild, CommandCreatorSync, RunCommand};
 use crate::util::{fmt_duration_as_secs, ref_env, run_input_output};
+use crate::{counted_array, dist};
 use async_trait::async_trait;
 use filetime::FileTime;
 use fs::File;
@@ -260,10 +262,13 @@ where
         // Set a maximum time limit for the cache to respond before we forge
         // ahead ourselves with a compilation.
         let timeout = Duration::new(60, 0);
-        let cache_status = tokio::time::timeout(timeout, cache_status);
+        let cache_status = async {
+            let res = tokio::time::timeout(timeout, cache_status).await;
+            let duration = start.elapsed();
+            (res, duration)
+        };
 
         // Check the result of the cache lookup.
-        let duration = start.elapsed();
         let outputs = compilation
             .outputs()
             .map(|output| FileObjectSource {
@@ -273,7 +278,7 @@ where
             .collect::<Vec<_>>();
 
         let lookup = match cache_status.await {
-            Ok(Ok(Cache::Hit(mut entry))) => {
+            (Ok(Ok(Cache::Hit(mut entry))), duration) => {
                 debug!(
                     "[{}]: Cache hit in {}",
                     out_pretty,
@@ -299,7 +304,7 @@ where
                     }
                 }
             }
-            Ok(Ok(Cache::Miss)) => {
+            (Ok(Ok(Cache::Miss)), duration) => {
                 debug!(
                     "[{}]: Cache miss in {}",
                     out_pretty,
@@ -307,7 +312,7 @@ where
                 );
                 Ok(CacheLookupResult::Miss(MissType::Normal))
             }
-            Ok(Ok(Cache::Recache)) => {
+            (Ok(Ok(Cache::Recache)), duration) => {
                 debug!(
                     "[{}]: Cache recache in {}",
                     out_pretty,
@@ -315,11 +320,16 @@ where
                 );
                 Ok(CacheLookupResult::Miss(MissType::ForcedRecache))
             }
-            Ok(Err(err)) => {
-                error!("[{}]: Cache read error: {:?}", out_pretty, err);
+            (Ok(Err(err)), duration) => {
+                error!(
+                    "[{}]: Cache read error: {:?} in {}",
+                    out_pretty,
+                    err,
+                    fmt_duration_as_secs(&duration)
+                );
                 Ok(CacheLookupResult::Miss(MissType::CacheReadError))
             }
-            Err(_elapsed) => {
+            (Err(_), duration) => {
                 debug!(
                     "[{}]: Cache timed out {}",
                     out_pretty,
@@ -1029,14 +1039,35 @@ where
         }
     } else {
         let executable = executable.to_owned();
-        let cc = detect_c_compiler(creator, executable, env.to_vec(), pool).await;
+        let cc = detect_c_compiler(creator, executable, args, env.to_vec(), pool).await;
         cc.map(|c| (c, None))
     }
 }
 
+ArgData! {
+    PassThrough(OsString),
+}
+use self::ArgData::PassThrough as Detect_PassThrough;
+
+// Establish a set of compiler flags that are required for
+// valid execution of the compiler even in preprocessor mode.
+// If the requested compiler invocatiomn has any of these arguments
+// propagate them when doing our compiler vendor detection
+//
+// Current known required flags:
+// ccbin/compiler-bindir needed for nvcc
+//  This flag specifies the host compiler to use otherwise
+//  gcc is expected to exist on the PATH. So if gcc doesn't exist
+//  compiler detection fails if we don't pass along the ccbin arg
+counted_array!(static ARGS: [ArgInfo<ArgData>; _] = [
+    take_arg!("--compiler-bindir", OsString, CanBeSeparated('='), Detect_PassThrough),
+    take_arg!("-ccbin", OsString, CanBeSeparated('='), Detect_PassThrough),
+]);
+
 async fn detect_c_compiler<T>(
     creator: T,
     executable: PathBuf,
+    arguments: &[OsString],
     env: Vec<(OsString, OsString)>,
     pool: tokio::runtime::Handle,
 ) -> Result<Box<dyn Compiler<T>>>
@@ -1084,6 +1115,17 @@ __VERSION__
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .envs(env.iter().map(|s| (&s.0, &s.1)));
+
+    // Iterate over all the arguments for compilation and extract
+    // any that are required for any valid execution of the compiler.
+    // Allowing our compiler vendor detection to always properly execute
+    for arg in ArgsIter::new(arguments.iter().cloned(), &ARGS[..]) {
+        let arg = arg.unwrap_or_else(|_| Argument::Raw(OsString::from("")));
+        if let Some(Detect_PassThrough(_)) = arg.get_data() {
+            let required_arg = arg.normalize(NormalizedDisposition::Concatenated);
+            cmd.args(&Vec::from_iter(required_arg.iter_os_strings()));
+        }
+    }
 
     cmd.arg("-E").arg(src);
     trace!("compiler {:?}", cmd);
@@ -1229,11 +1271,12 @@ where
 mod test {
     use super::*;
     use crate::cache::disk::DiskCache;
+    use crate::cache::CacheRead;
     use crate::mock_command::*;
     use crate::test::mock_storage::MockStorage;
     use crate::test::utils::*;
     use fs::File;
-    use std::io::Write;
+    use std::io::{Cursor, Write};
     use std::sync::Arc;
     use std::time::Duration;
     use std::u64;
@@ -1769,7 +1812,7 @@ LLVM version: 6.0",
         let f = TestFixture::new();
         let runtime = Runtime::new().unwrap();
         let pool = runtime.handle().clone();
-        let storage = MockStorage::new();
+        let storage = MockStorage::new(None);
         let storage: Arc<MockStorage> = Arc::new(storage);
         // Pretend to be GCC.
         next_command(&creator, Ok(MockChild::new(exit_status(0), "gcc", "")));
@@ -1838,6 +1881,82 @@ LLVM version: 6.0",
         assert_eq!(exit_status(0), res.status);
         assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
         assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
+    }
+
+    #[test]
+    /// Test that cache read timing is recorded.
+    fn test_compiler_get_cached_or_compile_cache_get_timing() {
+        drop(env_logger::try_init());
+        let creator = new_creator();
+        let f = TestFixture::new();
+        let runtime = Runtime::new().unwrap();
+        let pool = runtime.handle().clone();
+        // Make our storage wait 2ms for each get/put operation.
+        let storage_delay = Duration::from_millis(2);
+        let storage = MockStorage::new(Some(storage_delay));
+        let storage: Arc<MockStorage> = Arc::new(storage);
+        // Pretend to be GCC.
+        next_command(&creator, Ok(MockChild::new(exit_status(0), "gcc", "")));
+        let c = get_compiler_info(
+            creator.clone(),
+            &f.bins[0],
+            f.tempdir.path(),
+            &[],
+            &[],
+            &pool,
+            None,
+        )
+        .wait()
+        .unwrap()
+        .0;
+        // The preprocessor invocation.
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+        );
+        // The compiler invocation.
+        const COMPILER_STDOUT: &[u8] = b"compiler stdout";
+        const COMPILER_STDERR: &[u8] = b"compiler stderr";
+        let obj_file: &[u8] = &[1, 2, 3, 4];
+        // A cache entry to hand out
+        let mut cachewrite = CacheWrite::new();
+        cachewrite
+            .put_stdout(COMPILER_STDOUT)
+            .expect("Failed to store stdout");
+        cachewrite
+            .put_stderr(COMPILER_STDERR)
+            .expect("Failed to store stderr");
+        cachewrite
+            .put_object("obj", &mut Cursor::new(obj_file), None)
+            .expect("Failed to store cache object");
+        let entry = cachewrite.finish().expect("Failed to finish cache entry");
+        let entry = CacheRead::from(Cursor::new(entry)).expect("Failed to re-read cache entry");
+
+        let cwd = f.tempdir.path();
+        let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
+        let hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
+            CompilerArguments::Ok(h) => h,
+            o => panic!("Bad result from parse_arguments: {:?}", o),
+        };
+        storage.next_get(Ok(Cache::Hit(entry)));
+        let (cached, _res) = runtime
+            .block_on(hasher.get_cached_or_compile(
+                None,
+                creator,
+                storage,
+                arguments.clone(),
+                cwd.to_path_buf(),
+                vec![],
+                CacheControl::Default,
+                pool,
+            ))
+            .unwrap();
+        match cached {
+            CompileResult::CacheHit(duration) => {
+                assert!(duration >= storage_delay);
+            }
+            _ => panic!("Unexpected compile result: {:?}", cached),
+        }
     }
 
     #[test]

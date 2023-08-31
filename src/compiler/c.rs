@@ -26,7 +26,7 @@ use crate::mock_command::CommandCreatorSync;
 use crate::util::{hash_all, Digest, HashToDigest};
 use async_trait::async_trait;
 use fs_err as fs;
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -66,6 +66,9 @@ where
 pub enum Language {
     C,
     Cxx,
+    GenericHeader,
+    CHeader,
+    CxxHeader,
     ObjectiveC,
     ObjectiveCxx,
     Cuda,
@@ -131,12 +134,14 @@ impl Language {
         match file.extension().and_then(|e| e.to_str()) {
             // gcc: https://gcc.gnu.org/onlinedocs/gcc/Overall-Options.html
             Some("c") => Some(Language::C),
+            // Could be C or C++
+            Some("h") => Some(Language::GenericHeader),
             // TODO i
             Some("C") | Some("cc") | Some("cp") | Some("cpp") | Some("CPP") | Some("cxx")
             | Some("c++") => Some(Language::Cxx),
             // TODO ii
-            // TODO H hh hp hpp HPP hxx h++
-            // TODO tcc
+            Some("H") | Some("hh") | Some("hp") | Some("hpp") | Some("HPP") | Some("hxx")
+            | Some("h++") | Some("tcc") => Some(Language::CxxHeader),
             Some("m") => Some(Language::ObjectiveC),
             // TODO mi
             Some("M") | Some("mm") => Some(Language::ObjectiveCxx),
@@ -151,8 +156,9 @@ impl Language {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Language::C => "c",
-            Language::Cxx => "c++",
+            Language::C | Language::CHeader => "c",
+            Language::Cxx | Language::CxxHeader => "c++",
+            Language::GenericHeader => "c/c++",
             Language::ObjectiveC => "objc",
             Language::ObjectiveCxx => "objc++",
             Language::Cuda => "cuda",
@@ -687,9 +693,9 @@ impl pkg::ToolchainPackager for CToolchainPackager {
 /// The cache is versioned by the inputs to `hash_key`.
 pub const CACHE_VERSION: &[u8] = b"11";
 
-lazy_static! {
-    /// Environment variables that are factored into the cache key.
-    static ref CACHED_ENV_VARS: HashSet<&'static OsStr> = [
+/// Environment variables that are factored into the cache key.
+static CACHED_ENV_VARS: Lazy<HashSet<&'static OsStr>> = Lazy::new(|| {
+    [
         // SCCACHE_C_CUSTOM_CACHE_BUSTER has no particular meaning behind it,
         // serving as a way for the user to factor custom data into the hash.
         // One can set it to different values for different invocations
@@ -701,8 +707,11 @@ lazy_static! {
         "WATCHOS_DEPLOYMENT_TARGET",
         "SDKROOT",
         "CCC_OVERRIDE_OPTIONS",
-    ].iter().map(OsStr::new).collect();
-}
+    ]
+    .iter()
+    .map(OsStr::new)
+    .collect()
+});
 
 /// Compute the hash key of `compiler` compiling `preprocessor_output` with `args`.
 pub fn hash_key(
@@ -871,6 +880,17 @@ mod test {
         t("cxx", Language::Cxx);
         t("c++", Language::Cxx);
 
+        t("h", Language::GenericHeader);
+
+        t("hh", Language::CxxHeader);
+        t("H", Language::CxxHeader);
+        t("hp", Language::CxxHeader);
+        t("hxx", Language::CxxHeader);
+        t("hpp", Language::CxxHeader);
+        t("HPP", Language::CxxHeader);
+        t("h++", Language::CxxHeader);
+        t("tcc", Language::CxxHeader);
+
         t("m", Language::ObjectiveC);
 
         t("M", Language::ObjectiveCxx);
@@ -892,6 +912,8 @@ mod test {
         // gcc parses file-extensions as case-sensitive
         t("Cp");
         t("Cpp");
+        t("Hp");
+        t("Hpp");
         t("Mm");
         t("Cu");
     }
